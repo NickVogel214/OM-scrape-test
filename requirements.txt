@@ -1,0 +1,8 @@
+streamlit
+homeharvest
+plotly
+pandas
+xlsxwriter
+statsmodels
+pdfplumber
+usaddress
