@@ -396,19 +396,15 @@ def _parse_om_meta(text: str) -> Dict[str, Any]:
 
 def _parse_om_unit_mix_lines(text: str) -> pd.DataFrame:
     """
-    Best-effort parser for simple unit-mix lines, e.g.:
-    "1BR - 24 units - $1,950"
-    "2 BR / 2 BA ... Units: 12 ... Avg Rent: $2,450"
-    "Studio ... Units 10 ... Rent $1,650"
+    Parse unit mix lines from OM text. Returns cohort, units, avg_rent.
     """
-    rows: List[Dict[str, Any]] = []
-
+    rows = []
     for line in text.splitlines():
         s = line.strip().lower()
         if not s:
             continue
 
-        # Try to detect cohort first
+        # Detect cohort
         cohort = None
         if re.search(r"\bstudio\b|^std\b|efficiency", s):
             cohort = "Studio"
@@ -421,42 +417,42 @@ def _parse_om_unit_mix_lines(text: str) -> pd.DataFrame:
         elif re.search(r"\b4\s*br\b|\b4\s*bed\b|\bfour bedroom\b", s):
             cohort = "4BR+"
 
-        if cohort is None:
+        if not cohort:
             continue
 
         # Units
         m_units = re.search(r"(\d+)\s*units?", s)
-        units = int(m_units.group(1)) if m_units else None
+        units = int(m_units.group(1)) if m_units else 1
 
-        # Avg rent
+        # Rent
         m_rent = re.search(r"\$\s*([\d,]+(?:\.\d{1,2})?)", s)
         rent = _safe_float(m_rent.group(1)) if m_rent else None
-        if rent and rent > 10_000:  # annual → monthly heuristic
+        if rent and rent > 10000:  # probably annual
             rent = rent / 12.0
 
-        if units or rent:
-            rows.append({"cohort": cohort, "units": units, "avg_rent": rent})
+        rows.append({"cohort": cohort, "units": units, "avg_rent": rent})
 
     if not rows:
         return pd.DataFrame(columns=["cohort", "units", "avg_rent"])
 
-    # Aggregate duplicates (sum units, average rent weighted by units if present)
     df = pd.DataFrame(rows)
-    if "units" not in df.columns:
-        df["units"] = 1
 
-    def _weighted_avg(g):
-        g2 = g.dropna(subset=["avg_rent"])
-        if g2.empty:
+    # Weighted average rent per cohort
+    def weighted_avg(group):
+        rents = group.dropna(subset=["avg_rent"])
+        if rents.empty:
             return None
-        w = g2["units"].fillna(1)
-        return float((g2["avg_rent"] * w).sum() / w.sum())
+        return (rents["avg_rent"] * rents["units"]).sum() / rents["units"].sum()
 
     out = (
-        df.groupby("cohort")
-        .agg(units=("units", "sum"), avg_rent=("avg_rent", _weighted_avg))
-        .reset_index()
+        df.groupby("cohort", as_index=False)
+        .apply(lambda g: pd.Series({
+            "units": g["units"].sum(),
+            "avg_rent": weighted_avg(g)
+        }))
+        .reset_index(drop=True)
     )
+
     return out
 
 
