@@ -1,69 +1,79 @@
-import pdfplumber
-import re
-import pandas as pd
-from typing import Dict, Any, List, Optional
-from openai import OpenAI
 import os
+import re
+from typing import Dict, Any, List, Optional
+import pandas as pd
+import pdfplumber
+import cohere
 
-# Initialize LLM client (requires OPENAI_API_KEY in env)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize Cohere client
+co = cohere.Client(os.getenv("COHERE_API_KEY"))
 
-# --------------------------
-# Helpers
-# --------------------------
+# =============== helpers ===============
 
-def format_currency(value: float) -> str:
-    if pd.isna(value):
+def format_currency(val: Optional[float]) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
         return "N/A"
-    return f"${value:,.0f}"
+    try:
+        v = float(val)
+    except Exception:
+        return str(val)
+    return f"${v:,.0f}"
+
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce numeric-looking strings into numbers where possible."""
+    """Coerce numeric-like object columns to numeric, when possible."""
     for col in df.columns:
         if df[col].dtype == "object":
-            try:
-                df[col] = (
-                    df[col]
-                    .astype(str)
-                    .str.replace(",", "")
-                    .str.replace("$", "")
-                )
-                df[col] = pd.to_numeric(df[col], errors="ignore")
-            except Exception:
-                pass
+            s = df[col].astype(str)
+            s = s.str.replace(",", "", regex=False).str.replace("$", "", regex=False)
+            df[col] = pd.to_numeric(s, errors="ignore")
     return df
 
-# --------------------------
-# Meta info extraction
-# --------------------------
+
+# =============== metadata parse ===============
 
 def _parse_om_meta(text: str) -> Dict[str, Any]:
-    """Pulls location, value, year built/reno from OM text crudely."""
+    """
+    Crude metadata parser for value and years.
+    Location varies across OMs; the main app allows manual override if missing.
+    """
     meta = {"location": None, "value_usd": None, "year_built": None, "year_renovated": None}
 
-    year = re.search(r"Year Built[: ]+(\d{4})", text, re.I)
-    reno = re.search(r"(Renovated|Remodeled)[: ]+(\d{4})", text, re.I)
-    val  = re.search(r"\$([0-9,.]+)", text)
+    m_built = re.search(r"(?:Year\s*Built|Built)\s*[:\-]?\s*(19\d{2}|20\d{2})", text, re.I)
+    if m_built:
+        meta["year_built"] = int(m_built.group(1))
 
-    if year:
-        meta["year_built"] = int(year.group(1))
-    if reno:
-        meta["year_renovated"] = int(reno.group(2))
-    if val:
+    m_reno = re.search(r"(?:Year\s*(?:Renovated|Remodeled|Upgraded))\s*[:\-]?\s*(19\d{2}|20\d{2})", text, re.I)
+    if m_reno:
+        meta["year_renovated"] = int(m_reno.group(1))
+
+    m_val = re.search(
+        r"(?:Asking|Offering|Purchase|Valuation|Value)\s*(?:Price)?\s*[:\-]?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(million|mm|m)?",
+        text, re.I
+    )
+    if m_val:
+        raw, suffix = m_val.group(1), (m_val.group(2) or "").lower()
         try:
-            meta["value_usd"] = float(val.group(1).replace(",", ""))
-        except:
+            num = float(raw.replace(",", ""))
+            if suffix in {"million", "mm", "m"}:
+                num *= 1_000_000
+            meta["value_usd"] = num
+        except Exception:
             pass
+
+    # best-effort loose "City, ST ZIP" fallback for location
+    m_loc = re.search(r"\b([A-Za-z .'-]+),\s*([A-Z]{2})\s*(\d{5})(?:-\d{4})?\b", text)
+    if m_loc:
+        meta["location"] = f"{m_loc.group(1)}, {m_loc.group(2)} {m_loc.group(3)}"
+
     return meta
 
-# --------------------------
-# Unit Mix Extraction
-# --------------------------
 
-def _parse_unit_mix_llm(tables: List[List[str]]) -> pd.DataFrame:
+# =============== unit-mix extraction ===============
+
+def _parse_unit_mix_llm_cohere(tables: List[List[str]]) -> pd.DataFrame:
     """
-    Send candidate tables to LLM to decide which one is the unit mix,
-    and return structured cohort/unit/rent info.
+    Use Cohere LLM to identify the UNIT MIX table and return structured cohort/unit/rent info.
     """
     prompt = f"""
     You are given tables extracted from a multifamily Offering Memorandum PDF.
@@ -76,29 +86,30 @@ def _parse_unit_mix_llm(tables: List[List[str]]) -> pd.DataFrame:
       {{"cohort": "2BR", "units": 15, "avg_rent": 1850}}
     ]
 
-    If you cannot find rent data, return an empty list [].
+    If you cannot find rent data, return [].
 
     Tables:
     {tables}
     """
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a data parser."},
-                  {"role": "user", "content": prompt}],
+    resp = co.generate(
+        model="command-xlarge",
+        prompt=prompt,
+        max_tokens=500,
         temperature=0
     )
 
     import json
     try:
-        rows = json.loads(resp.choices[0].message.content.strip())
+        rows = json.loads(resp.generations[0].text.strip())
         return pd.DataFrame(rows)
     except Exception:
         return pd.DataFrame(columns=["cohort", "units", "avg_rent"])
 
+
 def extract_unit_mix_from_pdf(pdf_path: str) -> pd.DataFrame:
     """
-    Try extracting unit mix (cohort/units/avg_rent) using tables + LLM fallback.
+    Try extracting unit mix (cohort/units/avg_rent) using tables + Cohere LLM fallback.
     """
     tables = []
     text_blocks = []
@@ -106,7 +117,7 @@ def extract_unit_mix_from_pdf(pdf_path: str) -> pd.DataFrame:
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             # collect tables
-            for t in page.extract_tables():
+            for t in page.extract_tables() or []:
                 clean_t = [[c for c in row if c is not None] for row in t if any(row)]
                 if clean_t:
                     tables.append(clean_t)
@@ -114,8 +125,9 @@ def extract_unit_mix_from_pdf(pdf_path: str) -> pd.DataFrame:
             txt = page.extract_text() or ""
             text_blocks.append(txt)
 
+    # LLM attempt
     if tables:
-        df = _parse_unit_mix_llm(tables)
+        df = _parse_unit_mix_llm_cohere(tables)
         if not df.empty:
             return df
 
