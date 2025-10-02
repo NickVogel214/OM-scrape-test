@@ -260,6 +260,7 @@ def generate_market_insights(df: pd.DataFrame) -> List[str]:
             insights.append(f"📅 Properties built between {oldest:.0f} and {newest:.0f}")
 
     return insights
+
 # === OM PDF + COMPS COMPARISON UTILITIES (append to bottom of utils.py) ===
 from typing import Tuple
 from pdf_om_parser import parse_om_pdf
@@ -296,3 +297,90 @@ def compare_om_to_market(pdf_path: str, radius_miles: float = 3.0, limit: int = 
         "rent_delta": rent_delta,
         "raw_comps": comps,  # for optional tables/plots
     }
+# === OM Benchmarking helpers (append) ===
+"1BR": "1BR",
+"2BR": "2BR",
+"2BR/2BA": "2BR",
+"3BR": "3BR",
+}
+
+
+def _cohort_from_row(row: Dict) -> str:
+label = (row.get("label") or "").strip()
+return COHORT_MAP.get(label, f"{int(row.get('beds') or 0)}BR")
+
+
+
+
+def unit_weighted_avg(unit_mix: list[dict], field: str = "rent") -> float | None:
+df = pd.DataFrame(unit_mix)
+if df.empty or field not in df.columns:
+return None
+df = df.dropna(subset=[field])
+if df.empty:
+return None
+w = df["units"].fillna(1)
+return float((df[field] * w).sum() / w.sum())
+
+
+
+
+def benchmark_om(pdf_path: str, radius_miles: float = 3.0, limit: int = 400) -> Dict[str, Any]:
+om: OMParsed = parse_om_pdf(pdf_path)
+comps = get_rent_comps(location=om.location_str or "", radius_miles=radius_miles, limit=limit)
+by_br = comps.get("by_br", pd.DataFrame())
+
+
+# Build OM cohorts
+om_rows = om.unit_mix or []
+for r in om_rows:
+r["cohort"] = _cohort_from_row(r)
+om_df = pd.DataFrame(om_rows)
+
+
+# Aggregate OM by cohort (unit-weighted)
+om_by = pd.DataFrame(columns=["cohort","units","om_rent","om_rent_psf"])
+if not om_df.empty:
+grp = om_df.groupby("cohort")
+om_by = pd.DataFrame({
+"cohort": grp.size().index,
+"units": grp["units"].sum().values,
+"om_rent": grp.apply(lambda g: (g["rent"]*g["units"].fillna(1)).sum()/g["units"].fillna(1).sum()).values,
+"om_rent_psf": grp.apply(lambda g: ((g["rent"].fillna(0))/g["avg_sf"].replace(0, pd.NA)).mean(skipna=True)).values,
+})
+
+
+# Join with market stats
+bench = om_by.merge(by_br.rename(columns={
+"median_rent":"mkt_median",
+"mean_rent":"mkt_mean",
+"mean_rent_psf":"mkt_rent_psf"
+}), on="cohort", how="left")
+
+
+# Deltas & flags
+if not bench.empty:
+bench["delta_vs_median"] = bench["om_rent"] - bench["mkt_median"]
+bench["pct_vs_median"] = bench["delta_vs_median"] / bench["mkt_median"]
+bench["flag"] = bench.apply(lambda r: "↑ above market" if r["pct_vs_median"]>0.08 else ("↓ below market" if r["pct_vs_median"]<-0.08 else "≈ near market"), axis=1)
+
+
+portfolio_avg_om = unit_weighted_avg(om.unit_mix, "rent")
+portfolio_avg_psf = unit_weighted_avg([{**r, "rent_psf": r.get("rent")/(r.get("avg_sf") or pd.NA)} for r in om.unit_mix], "rent_psf") if (om.unit_mix) else None
+
+
+return {
+"meta": {
+"location": om.location_str,
+"value_usd": om.value_usd,
+"year_built": om.year_built,
+"year_renovated": om.year_renovated,
+"om_avg_rent_excerpt": om.om_avg_rent,
+},
+"om_unit_mix": om_df,
+"market_raw": comps.get("raw"),
+"market_by_bed": by_br,
+"benchmark": bench,
+"portfolio_avg_om": portfolio_avg_om,
+"portfolio_rent_psf": portfolio_avg_psf,
+}
