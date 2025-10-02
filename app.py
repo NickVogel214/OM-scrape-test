@@ -21,72 +21,82 @@ st.set_page_config(
 
 st.title("🏠 HuntingParty Real Estate Scraper")
 
+
 # =======================
-# OM vs COMPS (new block)
+# OM vs COMPS (enhanced)
 # =======================
 st.header("📑 OM vs Market Rents")
 with st.container(border=True):
-    colA, colB, colC = st.columns([2,1,1])
-    with colA:
-        uploaded_pdf = st.file_uploader("Upload Multifamily OM (PDF)", type=["pdf"])
-    with colB:
-        om_radius = st.slider("Comps radius (miles)", 1, 15, 3, help="Radius for rental comps around the OM location")
-    with colC:
-        om_limit = st.number_input("Max comps", min_value=20, max_value=2000, value=200, step=20)
+colA, colB, colC = st.columns([2,1,1])
+with colA:
+uploaded = st.file_uploader("Upload Multifamily OM PDF(s)", type=["pdf"], accept_multiple_files=True)
+with colB:
+om_radius = st.slider("Comps radius (miles)", 1, 15, 3)
+with colC:
+om_limit = st.number_input("Max comps", min_value=50, max_value=2000, value=400, step=50)
 
-    run_om = st.button("🔍 Analyze OM vs Comps", use_container_width=True)
 
-    if run_om:
-        if not uploaded_pdf:
-            st.error("Please upload a PDF OM first.")
-        else:
-            # save to a temp buffer for pdfplumber to read a real path-like
-            tmp_path = f"/tmp/om_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            with open(tmp_path, "wb") as f:
-                f.write(uploaded_pdf.read())
+run_om = st.button("🔍 Analyze OMs", use_container_width=True)
 
-            with st.spinner("Parsing OM and pulling nearby comps..."):
-                result = compare_om_to_market(tmp_path, radius_miles=om_radius, limit=om_limit)
 
-            # Metrics row
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("OM Avg Rent", f"{format_currency(result['om_avg_rent']) if result['om_avg_rent'] else 'N/A'}")
-            with m2:
-                st.metric("Comps Avg Rent", f"{format_currency(result['comps_avg_rent']) if result['comps_avg_rent'] else 'N/A'}")
-            with m3:
-                delta_txt = format_currency(result['rent_delta']) if result['rent_delta'] is not None else "N/A"
-                st.metric("OM – Comps", delta_txt)
-            with m4:
-                st.metric("Parsed Year Built", f"{int(result['year_built'])}" if result['year_built'] else "N/A")
+if run_om:
+if not uploaded:
+st.error("Please upload at least one PDF OM.")
+else:
+results = []
+for up in uploaded:
+tmp_path = f"/tmp/om_{up.name}"
+with open(tmp_path, "wb") as f:
+f.write(up.read())
+with st.spinner(f"Parsing {up.name} and pulling comps..."):
+from utils import benchmark_om
+res = benchmark_om(tmp_path, radius_miles=om_radius, limit=om_limit)
+res["_file"] = up.name
+results.append(res)
 
-            # Location/value details
-            st.write("**Parsed Location:**", result["location"] or "N/A")
-            details = []
-            if result["value_usd"] is not None:
-                details.append(f"Value: {format_currency(result['value_usd'])}")
-            if result["year_renovated"]:
-                details.append(f"Renovated: {int(result['year_renovated'])}")
-            if details:
-                st.write(" • ".join(details))
 
-            # Show comps table if available
-            comps = result["raw_comps"] or []
-            if comps:
-                st.subheader("Nearby Rental Comps")
-                comp_df = pd.DataFrame(comps)
-                display_cols = [c for c in ["street","city","state","zip_code","beds","baths","sqft","avg_rent"] if c in comp_df.columns]
-                if display_cols:
-                    comp_df_disp = comp_df[display_cols].copy()
-                    if "avg_rent" in comp_df_disp.columns:
-                        comp_df_disp["avg_rent"] = comp_df_disp["avg_rent"].apply(lambda x: f"${x:,.0f}")
-                    st.dataframe(comp_df_disp, use_container_width=True, hide_index=True)
-                else:
-                    st.dataframe(comp_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No comps found (try increasing the radius or limit).")
+# Display each report
+for res in results:
+st.subheader(f"Report: {res['_file']}")
+meta = res["meta"]
+meta_cols = st.columns(4)
+meta_cols[0].metric("Location", meta.get("location") or "N/A")
+meta_cols[1].metric("Value", format_currency(meta.get("value_usd")) if meta.get("value_usd") else "N/A")
+meta_cols[2].metric("Year Built", str(meta.get("year_built")) if meta.get("year_built") else "N/A")
+meta_cols[3].metric("Year Reno", str(meta.get("year_renovated")) if meta.get("year_renovated") else "N/A")
 
-st.markdown("---")
+
+om_mix = res["om_unit_mix"]
+if isinstance(om_mix, pd.DataFrame) and not om_mix.empty:
+st.write("**OM Unit Mix (parsed)**")
+st.dataframe(om_mix, use_container_width=True, hide_index=True)
+
+
+bench = res["benchmark"]
+if isinstance(bench, pd.DataFrame) and not bench.empty:
+st.write("**Benchmark by Bedroom Cohort**")
+display = bench[["cohort","units","om_rent","mkt_median","delta_vs_median","pct_vs_median","flag"]].copy()
+display["om_rent"] = display["om_rent"].map(lambda v: f"${v:,.0f}")
+display["mkt_median"] = display["mkt_median"].map(lambda v: f"${v:,.0f}")
+display["delta_vs_median"] = display["delta_vs_median"].map(lambda v: f"${v:,.0f}" if pd.notna(v) else "N/A")
+display["pct_vs_median"] = display["pct_vs_median"].map(lambda v: f"{v*100:.1f}%" if pd.notna(v) else "N/A")
+st.dataframe(display, use_container_width=True, hide_index=True)
+
+
+# Chart: OM vs Market by cohort
+try:
+import plotly.express as px
+chart_df = bench.dropna(subset=["om_rent","mkt_median"]).melt(
+id_vars=["cohort"], value_vars=["om_rent","mkt_median"], var_name="type", value_name="rent"
+)
+fig = px.bar(chart_df, x="cohort", y="rent", color="type", barmode="group", title="OM vs Market (Median) by Cohort")
+st.plotly_chart(fig, use_container_width=True)
+except Exception:
+pass
+
+
+# Downloads
+)
 
 # =======================
 # Original SCRAPER UI
