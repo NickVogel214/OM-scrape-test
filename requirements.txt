@@ -6,3 +6,4 @@ xlsxwriter
 statsmodels
 pdfplumber
 usaddress
+cohere
